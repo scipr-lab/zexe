@@ -10,13 +10,16 @@
 )]
 #![forbid(unsafe_code)]
 
-use ark_ff::{PrimeField, ToBytes};
-use ark_relations::r1cs::ConstraintSynthesizer;
+use ark_ff::ToBytes;
+use ark_relations::NPRelation;
 use ark_std::rand::{CryptoRng, RngCore};
 use core::fmt::Debug;
 
+/// Specialized interface for R1CS-based SNARKs.
+pub mod r1cs;
+
 /// The basic functionality for a SNARK.
-pub trait SNARK<F: PrimeField> {
+pub trait SNARK<R: NPRelation> {
     /// The information required by the prover to produce a proof for a specific
     /// circuit *C*.
     type ProvingKey: Clone;
@@ -35,63 +38,53 @@ pub trait SNARK<F: PrimeField> {
     /// Errors encountered during setup, proving, or verification.
     type Error: 'static + ark_std::error::Error;
 
-    /// Takes in a description of a computation (specified in R1CS constraints),
-    /// and samples proving and verification keys for that circuit.
-    fn circuit_specific_setup<C: ConstraintSynthesizer<F>, R: RngCore + CryptoRng>(
-        circuit: C,
-        rng: &mut R,
-    ) -> Result<(Self::ProvingKey, Self::VerifyingKey), Self::Error>;
-
     /// Generates a proof of satisfaction of the arithmetic circuit C (specified
     /// as R1CS constraints).
-    fn prove<C: ConstraintSynthesizer<F>, R: RngCore + CryptoRng>(
-        circuit_pk: &Self::ProvingKey,
-        circuit: C,
-        rng: &mut R,
+    fn prove<Rng: RngCore + CryptoRng>(
+        pk: &Self::ProvingKey,
+        index: &Option<R::Index>,
+        instance: &R::Instance,
+        witness: &R::Witness,
+        rng: &mut Rng,
     ) -> Result<Self::Proof, Self::Error>;
 
     /// Checks that `proof` is a valid proof of the satisfaction of circuit
-    /// encoded in `circuit_vk`, with respect to the public input `public_input`,
+    /// encoded in `vk`, with respect to the public input `public_input`,
     /// specified as R1CS constraints.
     fn verify(
-        circuit_vk: &Self::VerifyingKey,
-        public_input: &[F],
+        vk: &Self::VerifyingKey,
+        instance: &R::Instance,
         proof: &Self::Proof,
     ) -> Result<bool, Self::Error> {
-        let pvk = Self::process_vk(circuit_vk)?;
-        Self::verify_with_processed_vk(&pvk, public_input, proof)
+        let pvk = Self::process_vk(vk)?;
+        Self::verify_with_processed_vk(&pvk, instance, proof)
     }
 
-    /// Preprocesses `circuit_vk` to enable faster verification.
-    fn process_vk(
-        circuit_vk: &Self::VerifyingKey,
-    ) -> Result<Self::ProcessedVerifyingKey, Self::Error>;
+    /// Preprocesses `vk` to enable faster verification.
+    fn process_vk(vk: &Self::VerifyingKey) -> Result<Self::ProcessedVerifyingKey, Self::Error>;
 
     /// Checks that `proof` is a valid proof of the satisfaction of circuit
-    /// encoded in `circuit_pvk`, with respect to the public input `public_input`,
+    /// encoded in `pvk`, with respect to the public input `public_input`,
     /// specified as R1CS constraints.
     fn verify_with_processed_vk(
-        circuit_pvk: &Self::ProcessedVerifyingKey,
-        public_input: &[F],
+        pvk: &Self::ProcessedVerifyingKey,
+        instance: &R::Instance,
         proof: &Self::Proof,
     ) -> Result<bool, Self::Error>;
 }
 
 /// A SNARK with (only) circuit-specific setup.
-pub trait CircuitSpecificSetupSNARK<F: PrimeField>: SNARK<F> {
-    /// The setup algorithm for circuit-specific SNARKs. By default, this
-    /// just invokes `<Self as SNARK<F>>::circuit_specific_setup(...)`.
-    fn setup<C: ConstraintSynthesizer<F>, R: RngCore + CryptoRng>(
-        circuit: C,
-        rng: &mut R,
-    ) -> Result<(Self::ProvingKey, Self::VerifyingKey), Self::Error> {
-        <Self as SNARK<F>>::circuit_specific_setup(circuit, rng)
-    }
+pub trait CircuitSpecificSetupSNARK<R: NPRelation>: SNARK<R> {
+    /// The setup algorithm for circuit-specific SNARKs.
+    fn circuit_specific_setup<Rng: RngCore + CryptoRng>(
+        index: &R::Index,
+        rng: &mut Rng,
+    ) -> Result<(Self::ProvingKey, Self::VerifyingKey), Self::Error>;
 }
 
 /// A helper type for universal-setup SNARKs, which must infer their computation
 /// size bounds.
-pub enum UniversalSetupIndexError<Bound, E> {
+pub enum IndexingError<Bound, E> {
     /// The provided universal public parameters were insufficient to encode
     /// the given circuit.
     NeedLargerBound(Bound),
@@ -101,30 +94,57 @@ pub enum UniversalSetupIndexError<Bound, E> {
 
 /// A SNARK with universal setup. That is, a SNARK where the trusted setup is
 /// circuit-independent.
-pub trait UniversalSetupSNARK<F: PrimeField>: SNARK<F> {
+pub trait UniversalSetupSNARK<R: NPRelation>: SNARK<R> {
     /// Specifies how to bound the size of public parameters required to
     /// generate the index proving and verification keys for a given
     /// circuit.
-    type ComputationBound: Clone + Default + Debug;
+    ///
+    /// For example, for SNARKs that rely on polynomial commitments, this would
+    /// be the maximum degree of polynomials required to prove a given
+    /// instance.
+    type IndexBound: Clone + Default + Debug;
     /// Specifies the type of universal public parameters.
     type PublicParameters: Clone + Debug;
+
+    /// Specifies the bound size that is necessary and sufficient to
+    /// generate public parameters for `index`.
+    fn bound_for_index(index: &R::Index) -> Self::IndexBound;
 
     /// Specifies how to bound the size of public parameters required to
     /// generate the index proving and verification keys for a given
     /// circuit.
-    fn universal_setup<R: RngCore + CryptoRng>(
-        compute_bound: &Self::ComputationBound,
-        rng: &mut R,
+    fn universal_setup<Rng: RngCore + CryptoRng>(
+        compute_bound: &Self::IndexBound,
+        rng: &mut Rng,
     ) -> Result<Self::PublicParameters, Self::Error>;
 
     /// Indexes the public parameters according to the circuit `circuit`, and
     /// outputs circuit-specific proving and verification keys.
-    fn index<C: ConstraintSynthesizer<F>, R: RngCore + CryptoRng>(
+    ///
+    /// This is a *deterministic* method.
+    fn index(
         pp: &Self::PublicParameters,
-        circuit: C,
-        rng: &mut R,
-    ) -> Result<
-        (Self::ProvingKey, Self::VerifyingKey),
-        UniversalSetupIndexError<Self::ComputationBound, Self::Error>,
-    >;
+        index: &R::Index,
+    ) -> Result<(Self::ProvingKey, Self::VerifyingKey), IndexingError<Self::IndexBound, Self::Error>>;
+}
+
+impl<R: NPRelation, S> CircuitSpecificSetupSNARK<R> for S
+where
+    S: UniversalSetupSNARK<R>,
+{
+    /// The setup algorithm for circuit-specific SNARKs.
+    fn circuit_specific_setup<Rng: RngCore + CryptoRng>(
+        index: &R::Index,
+        rng: &mut Rng,
+    ) -> Result<(Self::ProvingKey, Self::VerifyingKey), Self::Error> {
+        let bound = Self::bound_for_index(index);
+        let pp = Self::universal_setup(&bound, rng)?;
+        Self::index(&pp, index).map_err(|e| {
+            if let IndexingError::Other(e) = e {
+                e
+            } else {
+                panic!("`bound_for_index` returned bound that is insufficient for indexing")
+            }
+        })
+    }
 }

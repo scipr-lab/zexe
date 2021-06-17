@@ -3,6 +3,7 @@
 ## Pending
 
 ### Breaking changes
+- [\#348](https://github.com/arkworks-rs/snark/pull/334) Introduce a `Relation` trait, change the `SNARK` traits to use it, and break down `ConstraintSynthesizer` into three traits.
 
 ### Features
 
@@ -21,6 +22,7 @@
 
 ### Bug fixes
 
+
 ## v0.2.0
 
 ### Breaking changes
@@ -33,6 +35,8 @@
 
 ### Bug fixes
 - [\#340](https://github.com/arkworks-rs/snark/pull/340) Compile with `panic='abort'` in release mode, for safety of the library across FFI boundaries.
+
+
 
 ## v0.1.0
 
